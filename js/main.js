@@ -1,6 +1,6 @@
 "use strict";
 
-const SQL_WASM_PATH = "https://inloop.github.io/sqlite-viewer/js/sql-wasm.wasm";
+const SQL_WASM_PATH = new URL("js/sql-wasm.wasm", document.baseURI).href;
 
 const SQL_FROM_REGEX = /FROM\s+((?=['"])((["'])(?<g1>[^'"]+))|(?<g2>\w+))/im;
 const SQL_LIMIT_REGEX = /LIMIT\s+(\d+)(?:\s*,\s*(\d+))?/im;
@@ -105,67 +105,87 @@ function loadDB(arrayBuffer) {
 
   resetTableList();
 
-  initSqlJs({ locateFile: (file) => SQL_WASM_PATH }).then(function (SQL) {
-    let tables = null;
-    try {
-      db = new SQL.Database(new Uint8Array(arrayBuffer));
+  initSqlJs({ locateFile: () => SQL_WASM_PATH })
+    .then(function (SQL) {
+      let tables = null;
+      try {
+        if (db !== null) {
+          db.close();
+        }
+        db = new SQL.Database(new Uint8Array(arrayBuffer));
 
-      //Get all table names from master table
-      tables = db.prepare(
-        "SELECT * FROM sqlite_master WHERE type='table' OR type='view' ORDER BY name"
-      );
-    } catch (ex) {
-      if (tables !== null) {
-        tables.free();
+        //Get all table names from master table
+        tables = db.prepare(
+          "SELECT * FROM sqlite_master WHERE type='table' OR type='view' ORDER BY name"
+        );
+      } catch (ex) {
+        if (tables !== null) {
+          tables.free();
+        }
+        setIsLoading(false);
+        window.alert(ex);
+        return;
       }
+
+      let firstTableName = null;
+      const tableList = $("#tables");
+
+      while (tables.step()) {
+        const rowObj = tables.getAsObject();
+        const name = rowObj["name"];
+        const type = rowObj["type"];
+
+        if (firstTableName === null) {
+          firstTableName = name;
+        }
+        const rowCount = getTableRowsCount(name);
+        loadedTableNames.push(name);
+        const tableType = type !== "table" ? `, ${type}` : "";
+        tableList.append(
+          $("<option>", {
+            value: name,
+            text: `${name} (${rowCount} rows${tableType})`,
+          })
+        );
+      }
+      tables.free();
+
+      // Check to see if the message table exists, otherwise select the first.
+      const hasMessageTable = loadedTableNames.includes("message");
+      if (hasMessageTable) {
+        firstTableName = "message";
+      } else {
+        tableList.val(firstTableName);
+      }
+      if (firstTableName !== null) {
+        tableList.val(firstTableName).trigger("change.select2");
+        doDefaultSelect(firstTableName);
+      } else {
+        showError("This database does not contain any tables or views.");
+      }
+
+      $("#output-box").fadeIn();
+      $(".nouploadinfo").hide();
+      $("#sample-db-link").hide();
+      $("#dropzone").delay(50).animate({ height: 75 }, 500);
+      $("#success-box").show();
+
       setIsLoading(false);
-      window.alert(ex);
-      return;
-    }
+    })
+    .catch(function (ex) {
+      setIsLoading(false);
+      showError(`Could not load the SQLite database: ${ex.message ?? ex}`);
+    });
+}
 
-    let firstTableName = null;
-    const tableList = $("#tables");
-
-    while (tables.step()) {
-      const rowObj = tables.getAsObject();
-      const name = rowObj["name"];
-      const type = rowObj["type"];
-
-      if (firstTableName === null) {
-        firstTableName = name;
-      }
-      const rowCount = getTableRowsCount(name);
-      loadedTableNames.push(name);
-      const tableType = type !== "table" ? `, ${type}` : "";
-      tableList.append(
-        `<option value="${name}">${name} (${rowCount} rows${tableType})</option>`
-      );
-    }
-    tables.free();
-
-    // check to see if the message table exists
-    const hasMessageTable = loadedTableNames.includes("message");
-    //Select first table and show It
-    if (hasMessageTable) {
-      firstTableName = "message";
-    } else {
-      tableList.val(firstTableName);
-    }
-    console.log({ firstTableName });
-    doDefaultSelect(firstTableName);
-
-    $("#output-box").fadeIn();
-    $(".nouploadinfo").hide();
-    $("#sample-db-link").hide();
-    $("#dropzone").delay(50).animate({ height: 75 }, 500);
-    $("#success-box").show();
-
-    setIsLoading(false);
-  });
+function quoteIdentifier(name) {
+  return `"${String(name).replaceAll('"', '""')}"`;
 }
 
 function getTableRowsCount(name) {
-  const sel = db.prepare(`SELECT COUNT(*) AS count FROM '${name}'`);
+  const sel = db.prepare(
+    `SELECT COUNT(*) AS count FROM ${quoteIdentifier(name)}`
+  );
   if (sel.step()) {
     const count = sel.getAsObject()["count"];
     sel.free();
@@ -208,7 +228,7 @@ function getQueryRowCount(query) {
 
 function getTableColumnTypes(tableName) {
   let result = new Map();
-  const sel = db.prepare(`PRAGMA table_info('${tableName}')`);
+  const sel = db.prepare(`PRAGMA table_info(${quoteIdentifier(tableName)})`);
 
   while (sel.step()) {
     const obj = sel.getAsObject();
@@ -237,7 +257,7 @@ function resetTableList() {
     templateSelection: selectFormatter,
     templateResult: selectFormatter,
   });
-  tables.on("change", function (e) {
+  tables.off("change.imessageExporter").on("change.imessageExporter", function () {
     doDefaultSelect(tables.val());
   });
 }
@@ -259,7 +279,7 @@ function dropzoneClick() {
 }
 
 function doDefaultSelect(name) {
-  const defaultSelect = `SELECT * FROM '${name}' LIMIT 0,30`;
+  const defaultSelect = `SELECT * FROM ${quoteIdentifier(name)} LIMIT 0,30`;
   editor.setValue(defaultSelect, -1);
   renderQuery(defaultSelect);
 }
@@ -429,7 +449,7 @@ function renderQuery(query) {
     const tr = $("<tr>");
     const s = sel.get();
     for (let i = 0; i < s.length; i++) {
-      const type = columnTypes.get(columnNames[i]).toLowerCase();
+      const type = (columnTypes.get(columnNames[i]) || "").toLowerCase();
       if (type === "blob" || type === "blob sub_type binary") {
         if (s[i] === null) {
           tr.append(`<td><span title="Blob">null</span></td>`);
@@ -491,17 +511,16 @@ function onKeyDown(e) {
 }
 
 function arrayToCsv(data) {
-  const cleanedData = data
-    .map(
-      (row) =>
+  return (
+    data
+      .map((row) =>
         row
-          .map(String) // Convert every value to String
-          .map((v) => v.replaceAll('"', '""')) // Escape double quotes
-          .map((v) => `"${v}"`) // Quote it
-          .join(",") // Comma-separated
-    )
-    .map((row) => new Blob([row + "\r\n"], { type: "text/csv" })); // Create blob for each row
-  return cleanedData;
+          .map((value) => (value === null ? "" : String(value)))
+          .map((value) => `"${value.replaceAll('"', '""')}"`)
+          .join(",")
+      )
+      .join("\r\n") + "\r\n"
+  );
 }
 
 function exportCsvTableQuery(query) {
@@ -530,11 +549,10 @@ function exportCsvTableQuery(query) {
 }
 
 function exportCsvTable(tableName) {
-  return exportCsvTableQuery(`SELECT * FROM '${tableName}'`);
+  return exportCsvTableQuery(`SELECT * FROM ${quoteIdentifier(tableName)}`);
 }
 
-// Modification in exportAllToCsv to handle Blob array
-function exportAllToCsv() {
+async function exportAllToCsv() {
   const processingMessage = $("#processing-message");
   const confirmation = confirm(
     "You are about to process all the files in the backup and convert them into a a series of CSV files stored in a compressed zip file. This could take a minute or two, are you sure you want to continue?"
@@ -548,33 +566,38 @@ function exportAllToCsv() {
   //   change the text of the export button to "Exporting..."
   console.info("Starting export of files to CSV zip...");
   setIsLoading(true);
-  const zip = new JSZip();
-  for (const tableName of loadedTableNames) {
-    console.log("Processing table: " + tableName + "...");
-    // if we're on a table that isn't chat, chat_message_join, or message, skip it
-    const acceptedTables = ["chat", "chat_message_join", "message"];
-    if (!acceptedTables.includes(tableName)) {
-      console.log(`Skipping table: ${tableName}`);
-      continue;
+  try {
+    const zip = new JSZip();
+    let exportedTableCount = 0;
+    for (const tableName of loadedTableNames) {
+      console.log("Processing table: " + tableName + "...");
+      const acceptedTables = ["chat", "chat_message_join", "message"];
+      if (!acceptedTables.includes(tableName)) {
+        console.log(`Skipping table: ${tableName}`);
+        continue;
+      }
+      const exportedRows = exportCsvTable(tableName);
+      if (exportedRows != null) {
+        console.log(
+          `Exported ${exportedRows.length} rows from table: ${tableName}`
+        );
+        zip.file(tableName + ".csv", arrayToCsv(exportedRows));
+        exportedTableCount += 1;
+      } else {
+        throw new Error(`Could not export table ${tableName}.`);
+      }
     }
-    const exportedRows = exportCsvTable(tableName);
-    if (exportedRows != null) {
-      console.log(
-        `Exported ${exportedRows.length} rows from table: ${tableName}`
-      );
-      const blobs = arrayToCsv(exportedRows); // This is now an array of Blobs
-      const blob = new Blob(blobs, { type: "text/csv" }); // Combine all row blobs into a single Blob
-      zip.file(tableName + ".csv", blob);
-    } else {
-      return;
+    if (exportedTableCount === 0) {
+      throw new Error("This database has none of the expected iMessage tables.");
     }
-  }
-
-  zip.generateAsync({ type: "blob" }).then(function (content) {
+    const content = await zip.generateAsync({ type: "blob" });
     saveAs(content, "exported_messages.zip");
-  });
-  processingMessage.hide();
-  setIsLoading(false);
+  } catch (ex) {
+    showError(ex.message ?? ex);
+  } finally {
+    processingMessage.hide();
+    setIsLoading(false);
+  }
 }
 
 function exportSelectedTableToCsv() {
@@ -584,7 +607,7 @@ function exportSelectedTableToCsv() {
   const exportedRows = exportCsvTable(tableName);
   if (exportedRows != null) {
     const blob = new Blob([arrayToCsv(exportedRows)], {
-      type: "text/plain;charset=utf-8",
+      type: "text/csv;charset=utf-8",
     });
     saveAs(blob, "exported_" + tableName.toLowerCase() + "_db.csv");
   }
@@ -599,7 +622,7 @@ function exportQueryTableToCsv() {
   const exportedRows = exportCsvTableQuery(query);
   if (exportedRows != null) {
     const blob = new Blob([arrayToCsv(exportedRows)], {
-      type: "text/plain;charset=utf-8",
+      type: "text/csv;charset=utf-8",
     });
     saveAs(blob, "exported_messages.csv");
   }
